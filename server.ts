@@ -4,8 +4,11 @@ import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
+import { isPetpoojaConfigured, fetchDailyPunches, buildDailySummary } from './petpoojaClient';
 
 dotenv.config();
+
+const PETPOOJA_STANDARD_SHIFT_HOURS = 8;
 
 function getIndianTimestamp(date = new Date()): string {
   try {
@@ -230,6 +233,57 @@ const MOCK_EMPLOYEES = [
     otherAllowance: 1200,
     bonus: 0,
     totalSalary: 67600
+  },
+  {
+    employeeCode: 'EMP007',
+    employeeName: 'Deepak Yadav',
+    designation: 'Factory Worker',
+    department: 'Production',
+    payroll: 'Daily Wage Contract',
+    basic: 0,
+    hra: 0,
+    splAllowance: 0,
+    conveyance: 0,
+    lta: 0,
+    otherAllowance: 0,
+    bonus: 0,
+    totalSalary: 0,
+    wageType: 'Daily',
+    dailyRate: 100
+  },
+  {
+    employeeCode: 'EMP008',
+    employeeName: 'Ramesh Chauhan',
+    designation: 'Factory Worker',
+    department: 'Production',
+    payroll: 'Daily Wage Contract',
+    basic: 0,
+    hra: 0,
+    splAllowance: 0,
+    conveyance: 0,
+    lta: 0,
+    otherAllowance: 0,
+    bonus: 0,
+    totalSalary: 0,
+    wageType: 'Daily',
+    dailyRate: 120
+  },
+  {
+    employeeCode: 'EMP009',
+    employeeName: 'Suresh Nair',
+    designation: 'Machine Operator',
+    department: 'Production',
+    payroll: 'Daily Wage Contract',
+    basic: 0,
+    hra: 0,
+    splAllowance: 0,
+    conveyance: 0,
+    lta: 0,
+    otherAllowance: 0,
+    bonus: 0,
+    totalSalary: 0,
+    wageType: 'Daily',
+    dailyRate: 130
   }
 ];
 
@@ -697,7 +751,9 @@ function mapMasterDataCSV(rows: string[][]) {
       lta: Number(parseFloat(row[9]) || 0),
       otherAllowance: Number(parseFloat(row[10]) || 0),
       bonus: Number(parseFloat(row[11]) || 0),
-      totalSalary: Number(parseFloat(row[12]) || 0)
+      totalSalary: Number(parseFloat(row[12]) || 0),
+      wageType: String(row[13] || 'Monthly').trim() === 'Daily' ? 'Daily' : 'Monthly',
+      dailyRate: Number(parseFloat(row[14]) || 0)
     });
   }
   return employees;
@@ -840,6 +896,8 @@ async function fetchAndNormalizeAppsScriptData(targetUrl: string, isArchive: boo
     otherAllowance: typeof e.otherAllowance === 'string' ? parseFloat(e.otherAllowance) : Number(e.otherAllowance || 0),
     bonus: typeof e.bonus === 'string' ? parseFloat(e.bonus) : Number(e.bonus || 0),
     totalSalary: typeof e.totalSalary === 'string' ? parseFloat(e.totalSalary) : Number(e.totalSalary || 0),
+    wageType: String(e.wageType || 'Monthly').trim() === 'Daily' ? 'Daily' : 'Monthly',
+    dailyRate: typeof e.dailyRate === 'string' ? parseFloat(e.dailyRate) : Number(e.dailyRate || 0),
   }));
 
   return {
@@ -1345,6 +1403,147 @@ app.post('/api/sheets/report-sync', async (req, res) => {
     } catch (localErr: any) {
       res.status(500).json({ error: localErr.message });
     }
+  }
+});
+
+// --- PETPOOJA BIOMETRIC ATTENDANCE INTEGRATION ---
+
+// Lightweight employee snapshot for matching biometric emp_id -> employeeCode and reading
+// wageType/dailyRate. Reuses whatever data source (live sheet cache or local db) is already active.
+async function getEmployeesSnapshot(): Promise<any[]> {
+  if (cachedSheetResponse?.employees?.length) {
+    return cachedSheetResponse.employees;
+  }
+  const activeUrl = getActiveAppsScriptUrl();
+  if (activeUrl && activeUrl.startsWith('http')) {
+    try {
+      const data = await fetchSheetDataForUrl(activeUrl, false);
+      return data.employees || [];
+    } catch (err) {
+      console.warn('getEmployeesSnapshot: falling back to local db:', (err as any).message);
+    }
+  }
+  return getLocalDb().employees || [];
+}
+
+app.get('/api/petpooja/status', (req, res) => {
+  res.json({ configured: isPetpoojaConfigured(), standardShiftHours: PETPOOJA_STANDARD_SHIFT_HOURS });
+});
+
+// Punch data + suggested overtime hours for a single date, for HR to review before queuing entries.
+app.get('/api/petpooja/punches', async (req, res) => {
+  if (!isPetpoojaConfigured()) {
+    res.status(400).json({ error: 'Petpooja API is not configured. Set PETPOOJA_BASE_URL, PETPOOJA_CLIENT_ID and PETPOOJA_CLIENT_SECRET as secrets.' });
+    return;
+  }
+  const payrollDate = String(req.query.date || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(payrollDate)) {
+    res.status(400).json({ error: 'Query parameter "date" must be in YYYY-MM-DD format' });
+    return;
+  }
+
+  try {
+    const punchData = await fetchDailyPunches(payrollDate);
+    const summary = buildDailySummary(punchData, PETPOOJA_STANDARD_SHIFT_HOURS);
+    res.json({ date: payrollDate, standardShiftHours: PETPOOJA_STANDARD_SHIFT_HOURS, employees: summary });
+  } catch (err: any) {
+    console.error('Petpooja punches fetch failed:', err.message);
+    res.status(502).json({ error: err.message || 'Failed to fetch punch data' });
+  }
+});
+
+// In-memory cache of per-day punch summaries, keyed by YYYY-MM-DD. Past days never change once
+// closed, so they're cached for the process lifetime; today's entry gets a short TTL so it refreshes.
+const attendanceDayCache = new Map<string, { summary: DailyPunchSummaryLite[]; cachedAt: number }>();
+const TODAY_CACHE_TTL_MS = 2 * 60 * 1000;
+
+type DailyPunchSummaryLite = { employeeCode: string; workedHours: number };
+
+async function getDaySummaryCached(dateStr: string, isToday: boolean): Promise<DailyPunchSummaryLite[]> {
+  const cached = attendanceDayCache.get(dateStr);
+  if (cached && (!isToday || Date.now() - cached.cachedAt < TODAY_CACHE_TTL_MS)) {
+    return cached.summary;
+  }
+  const punchData = await fetchDailyPunches(dateStr);
+  const summary = buildDailySummary(punchData, PETPOOJA_STANDARD_SHIFT_HOURS)
+    .map(s => ({ employeeCode: s.employeeCode, workedHours: s.workedHours }));
+  attendanceDayCache.set(dateStr, { summary, cachedAt: Date.now() });
+  return summary;
+}
+
+// Real-time daily-wage attendance & salary run-rate for a given month (defaults to current month).
+app.get('/api/petpooja/attendance-summary', async (req, res) => {
+  if (!isPetpoojaConfigured()) {
+    res.status(400).json({ error: 'Petpooja API is not configured. Set PETPOOJA_BASE_URL, PETPOOJA_CLIENT_ID and PETPOOJA_CLIENT_SECRET as secrets.' });
+    return;
+  }
+
+  const monthParam = String(req.query.month || '').trim();
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const match = /^(\d{4})-(\d{2})$/.exec(monthParam);
+  const year = match ? Number(match[1]) : nowIST.getFullYear();
+  const month = match ? Number(match[2]) - 1 : nowIST.getMonth();
+
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const isCurrentMonth = year === nowIST.getFullYear() && month === nowIST.getMonth();
+  const daysElapsed = isCurrentMonth ? nowIST.getDate() : daysInMonth;
+
+  try {
+    const employees = await getEmployeesSnapshot();
+    const dailyRateByCode = new Map<string, number>();
+    let fixedMonthlyTotal = 0;
+    let dailyWorkerCount = 0;
+    for (const e of employees) {
+      const wageType = String(e.wageType || 'Monthly');
+      if (wageType === 'Daily' && Number(e.dailyRate) > 0) {
+        dailyRateByCode.set(String(e.employeeCode), Number(e.dailyRate));
+        dailyWorkerCount++;
+      } else {
+        fixedMonthlyTotal += Number(e.totalSalary) || 0;
+      }
+    }
+
+    const dailyBreakdown: { date: string; presentCount: number; dailyWageCost: number }[] = [];
+    let actualDailyWageMTD = 0;
+
+    for (let day = 1; day <= daysElapsed; day++) {
+      const dateStr = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      const isToday = isCurrentMonth && day === daysElapsed;
+      let presentCount = 0;
+      let dailyWageCost = 0;
+      try {
+        const daySummary = await getDaySummaryCached(dateStr, isToday);
+        for (const entry of daySummary) {
+          const rate = dailyRateByCode.get(entry.employeeCode);
+          if (rate && entry.workedHours > 0) {
+            presentCount++;
+            dailyWageCost += rate;
+          }
+        }
+      } catch (dayErr: any) {
+        console.warn(`attendance-summary: failed to fetch punches for ${dateStr}:`, dayErr.message);
+      }
+      dailyBreakdown.push({ date: dateStr, presentCount, dailyWageCost });
+      actualDailyWageMTD += dailyWageCost;
+    }
+
+    const projectedDailyWageForMonth = daysElapsed > 0 ? (actualDailyWageMTD / daysElapsed) * daysInMonth : 0;
+
+    res.json({
+      month: `${year}-${String(month + 1).padStart(2, '0')}`,
+      daysInMonth,
+      daysElapsed,
+      dailyBreakdown,
+      totals: {
+        fixedMonthlyTotal: Math.round(fixedMonthlyTotal),
+        dailyWorkerCount,
+        actualDailyWageMTD: Math.round(actualDailyWageMTD),
+        projectedDailyWageForMonth: Math.round(projectedDailyWageForMonth)
+      }
+    });
+  } catch (err: any) {
+    console.error('Petpooja attendance-summary failed:', err.message);
+    res.status(502).json({ error: err.message || 'Failed to compute attendance summary' });
   }
 });
 

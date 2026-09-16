@@ -12,6 +12,8 @@ export interface Employee {
   otherAllowance: number;
   bonus: number;
   totalSalary: number;
+  wageType?: 'Monthly' | 'Daily'; // Daily = variable-headcount factory/contract workers paid per day present
+  dailyRate?: number; // Rupees per day present, only relevant when wageType === 'Daily'
 }
 
 export interface OvertimeRecord {
