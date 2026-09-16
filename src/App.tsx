@@ -40,6 +40,7 @@ import { AIChatAssistant } from './components/AIChatAssistant';
 import { SearchableDropdown } from './components/SearchableDropdown';
 import { BiometricSyncPanel } from './components/BiometricSyncPanel';
 import { SalaryEstimatorCard } from './components/SalaryEstimatorCard';
+import { fetchPetpoojaStatus, fetchPetpoojaOvertimeRecords } from './lib/petpoojaApi';
 
 import { 
   LogOut, 
@@ -73,7 +74,8 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronsLeft,
-  ChevronsRight
+  ChevronsRight,
+  RadioTower
 } from 'lucide-react';
 
 // Helper to get current month's start and end date (in local timezone)
@@ -98,28 +100,27 @@ function getCurrentMonthDateRange() {
   };
 }
 
-// Pre-process spreadsheet data to enrich records with numeric timestamps and fast calculation helpers
-function processSheetData(data: SpreadsheetData): SpreadsheetData {
-  if (!data?.records) return data;
+// Enriches raw overtime records with numeric timestamps, salary lookups and calculation helpers
+// used throughout the reporting pipeline. Shared by the Google Sheet path (processSheetData) and
+// the Petpooja-derived live view (which has no salary/timestamp fields of its own).
+function enrichOvertimeRecords(records: OvertimeRecord[], employees: Employee[]): OvertimeRecord[] {
   const empMap = new Map<string, Employee>();
-  if (data.employees) {
-    for (const e of data.employees) {
-      if (e.employeeCode) empMap.set(e.employeeCode, e);
-    }
+  for (const e of employees) {
+    if (e.employeeCode) empMap.set(e.employeeCode, e);
   }
 
   const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
   const LONG_MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
   const DAYS_OF_WEEK = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
 
-  const processedRecords = data.records.map(r => {
+  return records.map(r => {
     const parsedDate = parseDateString(r.date);
     const parsedTimestamp = isNaN(parsedDate.getTime()) ? 0 : parsedDate.getTime();
-    
+
     // Total Salary
     const emp = empMap.get(r.employeeCode);
-    const totalSalary = (r.totalSalary !== undefined && r.totalSalary > 0) 
-      ? r.totalSalary 
+    const totalSalary = (r.totalSalary !== undefined && r.totalSalary > 0)
+      ? r.totalSalary
       : (emp?.totalSalary || r.basic || emp?.basic || 0);
 
     const year = parsedDate.getFullYear() || 2026;
@@ -137,6 +138,10 @@ function processSheetData(data: SpreadsheetData): SpreadsheetData {
 
     return {
       ...r,
+      employeeName: r.employeeName || emp?.employeeName || r.employeeCode,
+      designation: r.designation || emp?.designation || '',
+      department: r.department || emp?.department || 'Unmatched',
+      payroll: r.payroll || emp?.payroll || '',
       totalSalary,
       parsedTimestamp,
       precomputedOTCost,
@@ -146,10 +151,14 @@ function processSheetData(data: SpreadsheetData): SpreadsheetData {
       dayName
     };
   });
+}
 
+// Pre-process spreadsheet data to enrich records with numeric timestamps and fast calculation helpers
+function processSheetData(data: SpreadsheetData): SpreadsheetData {
+  if (!data?.records) return data;
   return {
     ...data,
-    records: processedRecords
+    records: enrichOvertimeRecords(data.records, data.employees || [])
   };
 }
 
@@ -175,6 +184,13 @@ export default function App() {
   const [sheetsError, setSheetsError] = useState<string | null>(null);
   const [sheetData, setSheetData] = useState<SpreadsheetData | null>(null);
   const [lastSyncTime, setLastSyncTime] = useState<string>('Never');
+
+  // --- Reporting Data Source (Google Sheet vs. live Petpooja punch data) ---
+  const [reportDataSource, setReportDataSource] = useState<'sheet' | 'petpooja'>('sheet');
+  const [petpoojaConfigured, setPetpoojaConfigured] = useState(false);
+  const [petpoojaRecords, setPetpoojaRecords] = useState<OvertimeRecord[]>([]);
+  const [isLoadingPetpoojaRecords, setIsLoadingPetpoojaRecords] = useState(false);
+  const [petpoojaRecordsError, setPetpoojaRecordsError] = useState<string | null>(null);
 
   // --- Bulk Overtime Entry States ---
   const [entryMode, setEntryMode] = useState<'single' | 'bulk'>('single');
@@ -265,7 +281,53 @@ export default function App() {
       await syncData();
     };
     initStatusAndFetch();
+    fetchPetpoojaStatus()
+      .then(status => setPetpoojaConfigured(status.configured))
+      .catch(() => setPetpoojaConfigured(false));
   }, []);
+
+  // --- Fetch live overtime data derived from Petpooja punches for the current filter date range,
+  // whenever the "Petpooja" data source is selected (instead of the Google Sheet's Response tab) ---
+  useEffect(() => {
+    if (reportDataSource !== 'petpooja') return;
+    let cancelled = false;
+
+    const loadPetpoojaRecords = async () => {
+      setIsLoadingPetpoojaRecords(true);
+      setPetpoojaRecordsError(null);
+      try {
+        const res = await fetchPetpoojaOvertimeRecords(filters.startDate, filters.endDate);
+        if (cancelled) return;
+        const raw: OvertimeRecord[] = res.records.map(r => ({
+          rowIndex: -1,
+          timestamp: '',
+          employeeCode: r.employeeCode,
+          employeeName: r.employeeName,
+          designation: '',
+          department: '',
+          payroll: '',
+          date: r.date,
+          overtimeHours: r.overtimeHours,
+          foodingApplicable: calculateFooding(r.overtimeHours),
+          enteredBy: 'Petpooja Biometric Sync',
+          remarks: '',
+          reasonForOvertime: 'Biometric Attendance (Live)',
+        }));
+        setPetpoojaRecords(enrichOvertimeRecords(raw, sheetData?.employees || []));
+      } catch (err: any) {
+        if (!cancelled) setPetpoojaRecordsError(err.message || 'Failed to load Petpooja overtime data');
+      } finally {
+        if (!cancelled) setIsLoadingPetpoojaRecords(false);
+      }
+    };
+
+    loadPetpoojaRecords();
+    return () => { cancelled = true; };
+  }, [reportDataSource, filters.startDate, filters.endDate, sheetData?.employees]);
+
+  // Records actually driving the reporting pipeline (KPIs, charts, analytics, logs table) below --
+  // either the Google Sheet's Response tab (default, unchanged) or the live Petpooja punch view.
+  const effectiveRecords = reportDataSource === 'petpooja' ? petpoojaRecords : (sheetData?.records || []);
 
   // --- Fetch latest values from the spreadsheet ---
   const syncData = async (isSilent = false) => {
@@ -978,7 +1040,7 @@ export default function App() {
     const startTs = deferredFilters.startDate ? parseDateString(deferredFilters.startDate).getTime() : null;
     const endTs = deferredFilters.endDate ? parseDateString(deferredFilters.endDate).getTime() + 86399999 : null;
 
-    let dateRecords = sheetData.records || [];
+    let dateRecords = effectiveRecords;
     if (startTs !== null || endTs !== null) {
       dateRecords = dateRecords.filter(rec => {
         const recTs = rec.parsedTimestamp ?? parseDateString(rec.date).getTime();
@@ -1052,11 +1114,11 @@ export default function App() {
       remarks: Array.from(rems).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
       reasons: Array.from(reas).sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' })),
     };
-  }, [sheetData, deferredFilters]);
+  }, [sheetData, effectiveRecords, deferredFilters]);
 
   // --- Apply dynamic filters to Admin reports view ---
   const filteredRecords = useMemo(() => {
-    if (!sheetData?.records) return [];
+    if (!effectiveRecords.length) return [];
 
     const startTs = deferredFilters.startDate ? parseDateString(deferredFilters.startDate).getTime() : null;
     const endTs = deferredFilters.endDate ? parseDateString(deferredFilters.endDate).getTime() + 86399999 : null;
@@ -1064,7 +1126,7 @@ export default function App() {
     const otVal = parseFloat(deferredFilters.overtimeHoursValue);
     const isOtValid = !isNaN(otVal) && deferredFilters.overtimeHoursOperator !== 'all';
 
-    const filtered = sheetData.records.filter(rec => {
+    const filtered = effectiveRecords.filter(rec => {
       const recTs = rec.parsedTimestamp ?? parseDateString(rec.date).getTime();
 
       // Date Range filter (Instant numeric comparison)
@@ -1135,7 +1197,7 @@ export default function App() {
       const tsB = b.parsedTimestamp ?? parseDateString(b.date).getTime();
       return tsB - tsA;
     });
-  }, [sheetData, deferredFilters]);
+  }, [effectiveRecords, deferredFilters]);
 
   // --- Pagination logic for Admin Overtime Logs ---
   const effectivePageSize = pageSize === 'all' ? (filteredRecords.length || 1) : pageSize;
@@ -2581,6 +2643,40 @@ export default function App() {
                     </button>
                   </div>
 
+                  {/* Data Source Toggle: Google Sheet (saved records) vs. live Petpooja punch data */}
+                  <div className="flex flex-wrap items-center gap-3 pb-1">
+                    <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">Data Source</span>
+                    <div className="flex bg-slate-100 p-1 rounded-xl gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setReportDataSource('sheet')}
+                        className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-all cursor-pointer flex items-center gap-1.5 ${reportDataSource === 'sheet' ? 'bg-white text-slate-800 shadow-3xs' : 'text-slate-500 hover:text-slate-700'}`}
+                      >
+                        <FileSpreadsheet className="w-3.5 h-3.5" /> Google Sheet
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => petpoojaConfigured && setReportDataSource('petpooja')}
+                        disabled={!petpoojaConfigured}
+                        title={petpoojaConfigured ? '' : 'Connect PETPOOJA_BASE_URL / CLIENT_ID / CLIENT_SECRET as Secrets to enable this'}
+                        className={`px-3.5 py-1.5 text-xs font-semibold rounded-lg transition-all flex items-center gap-1.5 ${reportDataSource === 'petpooja' ? 'bg-white text-slate-800 shadow-3xs' : 'text-slate-500 hover:text-slate-700'} ${petpoojaConfigured ? 'cursor-pointer' : 'cursor-not-allowed opacity-50'}`}
+                      >
+                        <RadioTower className="w-3.5 h-3.5" /> Petpooja Live
+                      </button>
+                    </div>
+                    {reportDataSource === 'petpooja' && (
+                      <span className="text-[10px] text-slate-400 font-medium flex items-center gap-1.5">
+                        {isLoadingPetpoojaRecords ? (
+                          <><RefreshCw className="w-3 h-3 animate-spin" /> Fetching punch data for the selected date range&hellip;</>
+                        ) : petpoojaRecordsError ? (
+                          <span className="text-rose-600 font-semibold">{petpoojaRecordsError}</span>
+                        ) : (
+                          <>Read-only live view computed from biometric punches &mdash; not saved to the Sheet, editing/deleting is disabled.</>
+                        )}
+                      </span>
+                    )}
+                  </div>
+
                   <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4 text-xs">
                     <div>
                       <label className="block text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Start Date</label>
@@ -2910,20 +3006,26 @@ export default function App() {
                               <td className="py-3 px-3 text-slate-400 text-[10px] font-medium whitespace-nowrap min-w-[90px]">{rec.enteredBy}</td>
                               {appUser.type === 'Admin' && (
                                 <td className="py-3 px-3 text-right print:hidden whitespace-nowrap min-w-[80px]">
-                                  <button
-                                    onClick={() => handleOpenEditRecord(rec)}
-                                    className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg inline-block mr-1 cursor-pointer transition-colors"
-                                    title="Edit entry"
-                                  >
-                                    <Edit3 className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={() => handleDeleteRecord(rec)}
-                                    className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg inline-block cursor-pointer transition-colors"
-                                    title="Delete entry"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+                                  {rec.rowIndex === -1 ? (
+                                    <span className="text-[9px] font-semibold uppercase tracking-wider text-indigo-400" title="Live Petpooja view -- not a saved record">Read-only</span>
+                                  ) : (
+                                    <>
+                                      <button
+                                        onClick={() => handleOpenEditRecord(rec)}
+                                        className="p-1.5 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg inline-block mr-1 cursor-pointer transition-colors"
+                                        title="Edit entry"
+                                      >
+                                        <Edit3 className="w-3.5 h-3.5" />
+                                      </button>
+                                      <button
+                                        onClick={() => handleDeleteRecord(rec)}
+                                        className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg inline-block cursor-pointer transition-colors"
+                                        title="Delete entry"
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </>
+                                  )}
                                 </td>
                               )}
                             </tr>

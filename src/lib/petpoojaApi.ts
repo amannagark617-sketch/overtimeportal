@@ -59,3 +59,23 @@ export async function fetchAttendanceSummary(month: string): Promise<AttendanceS
   const response = await fetch(`/api/petpooja/attendance-summary?month=${encodeURIComponent(month)}`);
   return handleJson<AttendanceSummary>(response);
 }
+
+export interface PetpoojaOvertimeRecord {
+  employeeCode: string;
+  employeeName: string;
+  date: string;
+  overtimeHours: number;
+  workedHours: number;
+}
+
+export interface PetpoojaOvertimeRecordsResponse {
+  start: string;
+  end: string;
+  standardShiftHours: number;
+  records: PetpoojaOvertimeRecord[];
+}
+
+export async function fetchPetpoojaOvertimeRecords(start: string, end: string): Promise<PetpoojaOvertimeRecordsResponse> {
+  const response = await fetch(`/api/petpooja/overtime-records?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+  return handleJson<PetpoojaOvertimeRecordsResponse>(response);
+}
