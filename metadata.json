@@ -1,0 +1,6 @@
+{
+  "name": "Employee Overtime ERP",
+  "description": "A secure, production-ready enterprise resource planning application for managing employee overtime logged live with a Google Sheets database.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
