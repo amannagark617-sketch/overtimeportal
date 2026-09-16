@@ -4,7 +4,7 @@ import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
-import { isPetpoojaConfigured, fetchDailyPunches, buildDailySummary } from './petpoojaClient';
+import { isPetpoojaConfigured, fetchDailyPunches, buildDailySummary, DailyPunchSummary } from './petpoojaClient';
 
 dotenv.config();
 
@@ -1454,19 +1454,22 @@ app.get('/api/petpooja/punches', async (req, res) => {
 
 // In-memory cache of per-day punch summaries, keyed by YYYY-MM-DD. Past days never change once
 // closed, so they're cached for the process lifetime; today's entry gets a short TTL so it refreshes.
-const attendanceDayCache = new Map<string, { summary: DailyPunchSummaryLite[]; cachedAt: number }>();
+const attendanceDayCache = new Map<string, { summary: DailyPunchSummary[]; cachedAt: number }>();
 const TODAY_CACHE_TTL_MS = 2 * 60 * 1000;
 
-type DailyPunchSummaryLite = { employeeCode: string; workedHours: number };
+function isTodayIST(dateStr: string): boolean {
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const todayStr = `${nowIST.getFullYear()}-${String(nowIST.getMonth() + 1).padStart(2, '0')}-${String(nowIST.getDate()).padStart(2, '0')}`;
+  return dateStr === todayStr;
+}
 
-async function getDaySummaryCached(dateStr: string, isToday: boolean): Promise<DailyPunchSummaryLite[]> {
+async function getDaySummaryCached(dateStr: string, isToday: boolean = isTodayIST(dateStr)): Promise<DailyPunchSummary[]> {
   const cached = attendanceDayCache.get(dateStr);
   if (cached && (!isToday || Date.now() - cached.cachedAt < TODAY_CACHE_TTL_MS)) {
     return cached.summary;
   }
   const punchData = await fetchDailyPunches(dateStr);
-  const summary = buildDailySummary(punchData, PETPOOJA_STANDARD_SHIFT_HOURS)
-    .map(s => ({ employeeCode: s.employeeCode, workedHours: s.workedHours }));
+  const summary = buildDailySummary(punchData, PETPOOJA_STANDARD_SHIFT_HOURS);
   attendanceDayCache.set(dateStr, { summary, cachedAt: Date.now() });
   return summary;
 }
@@ -1544,6 +1547,75 @@ app.get('/api/petpooja/attendance-summary', async (req, res) => {
   } catch (err: any) {
     console.error('Petpooja attendance-summary failed:', err.message);
     res.status(502).json({ error: err.message || 'Failed to compute attendance summary' });
+  }
+});
+
+const MAX_OVERTIME_RANGE_DAYS = 92;
+
+function enumerateDates(start: string, end: string): string[] {
+  const dates: string[] = [];
+  const cursor = new Date(`${start}T00:00:00`);
+  const endDate = new Date(`${end}T00:00:00`);
+  while (cursor.getTime() <= endDate.getTime()) {
+    const y = cursor.getFullYear();
+    const m = String(cursor.getMonth() + 1).padStart(2, '0');
+    const d = String(cursor.getDate()).padStart(2, '0');
+    dates.push(`${y}-${m}-${d}`);
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return dates;
+}
+
+// Read-only "what would the overtime log look like from biometric data alone" view for a date
+// range -- used by the report's Petpooja/Google Sheet data-source toggle. Purely computed from
+// live punch data each call; nothing here is written to the Sheet or any local store.
+app.get('/api/petpooja/overtime-records', async (req, res) => {
+  if (!isPetpoojaConfigured()) {
+    res.status(400).json({ error: 'Petpooja API is not configured. Set PETPOOJA_BASE_URL, PETPOOJA_CLIENT_ID and PETPOOJA_CLIENT_SECRET as secrets.' });
+    return;
+  }
+
+  const start = String(req.query.start || '').trim();
+  const end = String(req.query.end || '').trim();
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)) {
+    res.status(400).json({ error: 'Query parameters "start" and "end" must be in YYYY-MM-DD format' });
+    return;
+  }
+  if (end < start) {
+    res.status(400).json({ error: '"end" date must not be before "start" date' });
+    return;
+  }
+
+  const dates = enumerateDates(start, end);
+  if (dates.length > MAX_OVERTIME_RANGE_DAYS) {
+    res.status(400).json({ error: `Date range too large for a live Petpooja view (max ${MAX_OVERTIME_RANGE_DAYS} days) -- narrow the filter dates and try again.` });
+    return;
+  }
+
+  try {
+    const records: { employeeCode: string; employeeName: string; date: string; overtimeHours: number; workedHours: number }[] = [];
+    for (const dateStr of dates) {
+      try {
+        const daySummary = await getDaySummaryCached(dateStr);
+        for (const entry of daySummary) {
+          if (entry.otHours > 0) {
+            records.push({
+              employeeCode: entry.employeeCode,
+              employeeName: entry.employeeName,
+              date: dateStr,
+              overtimeHours: entry.otHours,
+              workedHours: entry.workedHours
+            });
+          }
+        }
+      } catch (dayErr: any) {
+        console.warn(`overtime-records: failed to fetch punches for ${dateStr}:`, dayErr.message);
+      }
+    }
+    res.json({ start, end, standardShiftHours: PETPOOJA_STANDARD_SHIFT_HOURS, records });
+  } catch (err: any) {
+    console.error('Petpooja overtime-records failed:', err.message);
+    res.status(502).json({ error: err.message || 'Failed to compute overtime records from punch data' });
   }
 });
 
