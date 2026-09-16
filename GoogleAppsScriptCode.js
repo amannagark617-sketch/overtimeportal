@@ -38,6 +38,14 @@
  * 7. Execute as: "Me", Who has access: "Anyone".
  * 8. Click Deploy, authorize permissions (Advanced > Go to Untitled project > Allow), and copy the Web App URL.
  * 9. Enter this URL into the application configuration panel.
+ *
+ * OPTIONAL - DAILY-WAGE WORKERS:
+ * To track variable-headcount factory/contract workers paid a flat rate per day present
+ * (instead of a fixed monthly salary), add two columns to the end of your "Master Data" sheet:
+ *   Column N (14): "Wage Type"  -> set to "Daily" for these workers (leave blank/"Monthly" for
+ *                                   fixed-salary staff)
+ *   Column O (15): "Daily Rate" -> the rupee amount paid for each day the worker is present
+ * These employees are matched to biometric punch data by Employee Code == the device's Emp ID.
  */
 
 var SPREADSHEET_ID = "122tkJJM7x5CQWsyaMdVYNQesvpIuqYlAzi5w4lxZ3Sw";
@@ -326,7 +334,12 @@ function doGet(e) {
             lta: Number(row[9] || 0),
             otherAllowance: Number(row[10] || 0),
             bonus: Number(row[11] || 0),
-            totalSalary: Number(row[12] || 0)
+            totalSalary: Number(row[12] || 0),
+            // Optional columns (14: Wage Type, 15: Daily Rate) for variable-headcount daily-wage
+            // workers (e.g. factory contract staff paid per day present). Defaults to Monthly/0
+            // when the columns don't exist, so this is backward-compatible with older sheets.
+            wageType: String(row[13] || 'Monthly').trim() === 'Daily' ? 'Daily' : 'Monthly',
+            dailyRate: Number(row[14] || 0)
           });
         }
       }

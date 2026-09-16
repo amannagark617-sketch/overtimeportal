@@ -38,6 +38,8 @@ import { AnalyticsTabs } from './components/AnalyticsTabs';
 import { EmployeeHistoryModal } from './components/EmployeeHistoryModal';
 import { AIChatAssistant } from './components/AIChatAssistant';
 import { SearchableDropdown } from './components/SearchableDropdown';
+import { BiometricSyncPanel } from './components/BiometricSyncPanel';
+import { SalaryEstimatorCard } from './components/SalaryEstimatorCard';
 
 import { 
   LogOut, 
@@ -647,6 +649,69 @@ export default function App() {
       showToast(msg, 'success');
     } else {
       showToast('All selected employees already have overtime entries queued or recorded for this date!', 'error');
+    }
+  };
+
+  // --- Import suggested overtime entries fetched from the biometric punch device into the bulk queue ---
+  const handleImportBiometricEntries = (items: { employeeCode: string; otHours: number; date: string }[]) => {
+    if (items.length === 0) return;
+
+    if (!remarks.trim()) {
+      showToast('Enter the OPF Number above first (it will be applied to all imported rows)', 'error');
+      return;
+    }
+    if (!reasonForOvertime.trim()) {
+      showToast('Select a Reason for Overtime above first (it will be applied to all imported rows)', 'error');
+      return;
+    }
+
+    const addedList: typeof bulkList = [];
+    let skippedCount = 0;
+
+    for (const item of items) {
+      const emp = sheetData?.employees?.find(e => e.employeeCode === item.employeeCode);
+      if (!emp) { skippedCount++; continue; }
+
+      const isDuplicateInBulk = bulkList.some(
+        b => b.employeeCode === emp.employeeCode && b.date === item.date
+      ) || addedList.some(b => b.employeeCode === emp.employeeCode && b.date === item.date);
+      const isDuplicateInDb = sheetData?.records.some(
+        r => r.employeeCode === emp.employeeCode && r.date === item.date
+      );
+      if (isDuplicateInBulk || isDuplicateInDb) { skippedCount++; continue; }
+
+      addedList.push({
+        employeeCode: emp.employeeCode,
+        employeeName: emp.employeeName,
+        designation: emp.designation,
+        department: emp.department,
+        payroll: emp.payroll,
+        date: item.date,
+        overtimeHours: item.otHours,
+        foodingApplicable: calculateFooding(item.otHours),
+        remarks: remarks.trim().toUpperCase(),
+        reasonForOvertime: reasonForOvertime.trim(),
+        approvalForOT: '',
+        basic: emp.basic,
+        hra: emp.hra,
+        splAllowance: emp.splAllowance,
+        conveyance: emp.conveyance,
+        lta: emp.lta,
+        otherAllowance: emp.otherAllowance,
+        bonus: emp.bonus,
+        totalSalary: emp.totalSalary,
+      });
+    }
+
+    if (addedList.length > 0) {
+      setEntryMode('bulk');
+      setBulkList(prev => [...prev, ...addedList]);
+      setBulkSaveError(null);
+      let msg = `Imported ${addedList.length} entr${addedList.length === 1 ? 'y' : 'ies'} from biometric device.`;
+      if (skippedCount > 0) msg += ` (${skippedCount} skipped as duplicate/unmatched)`;
+      showToast(msg, 'success');
+    } else {
+      showToast('Nothing imported — all rows were duplicates or had an unmatched employee code', 'error');
     }
   };
 
@@ -1870,6 +1935,13 @@ export default function App() {
                       </div>
                     </div>
 
+                    {/* Biometric Device Punch Import */}
+                    <BiometricSyncPanel
+                      employees={sheetData?.employees || []}
+                      existingRecords={sheetData?.records || []}
+                      onImport={handleImportBiometricEntries}
+                    />
+
                     {/* MODE A: SINGLE EMPLOYEE MODE */}
                     {entryMode === 'single' && (
                       <div className="space-y-4">
@@ -2677,6 +2749,11 @@ export default function App() {
                     </div>
                   </div>
                 </div>
+
+                {/* Real-Time Estimated Salary This Month */}
+                {sheetData && (
+                  <SalaryEstimatorCard employees={sheetData.employees} records={sheetData.records} />
+                )}
 
                 {/* 3. Admin Dashboard KPI Cards Grid */}
                 <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
